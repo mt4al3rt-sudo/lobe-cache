@@ -202,7 +202,7 @@ if [ "$need_ocr" = 1 ] && ! ok_ocr; then
     install_debs deb || true
   fi
 fi
-if ! ok_ocr; then
+if [ "$need_ocr" = 1 ] && ! ok_ocr; then
   echo "[cache] tesseract: pasang via apt resmi"
   apt-get update -qq || true
   apt-get install -y -qq --no-install-recommends \
@@ -216,7 +216,7 @@ if [ "$need_ocr" = 1 ] && ! ok_py; then
     pip install -q --no-index --no-deps --find-links=whl $PY_PINS >/dev/null 2>&1 || true
   fi
 fi
-if ! ok_py; then
+if [ "$need_ocr" = 1 ] && ! ok_py; then
   echo "[cache] paket python: pasang via PyPI (versi dikunci)"
   # --no-deps wajib: set pin sudah lengkap; tanpa ini resolver menarik opencv-python
   # (varian GUI) yang menautkan libxcb/libGL dan gagal di image minimal.
