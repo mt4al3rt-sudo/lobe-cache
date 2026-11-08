@@ -26,7 +26,7 @@ HF_REPO="Systran/faster-whisper-small"
 HF_REV="${LOBE_CACHE_HF_REV:-536b0662742c02347bc0e980a01041f333bce120}"
 
 # Versi dikunci — identik dengan PINS di .github/workflows/build-cache.yml (29 paket).
-PY_PINS="rapidocr-onnxruntime==1.4.4 opencv-python==5.0.0.93 numpy==2.4.6 onnxruntime==1.31.1
+PY_PINS="rapidocr-onnxruntime==1.4.4 opencv-python-headless==4.12.0.88 numpy==2.4.6 onnxruntime==1.31.1
 pyclipper==1.4.0 pillow==13.0.0 pyyaml==6.0.3 shapely==2.2.0 six==1.17.0 tqdm==4.70.1
 faster-whisper==1.2.1 ctranslate2==4.8.5 av==18.1.0 tokenizers==0.23.3 huggingface_hub==2.4.0
 hf-xet==1.8.0 filelock==4.2.9 fsspec==2026.9.0 packaging==26.3 typing_extensions==4.16.0
@@ -145,7 +145,9 @@ fi
 # --- 4. fallback python via PyPI, versi dikunci sama ---
 if ! ok_py; then
   echo "[cache] paket python: pasang via PyPI (versi dikunci)"
-  pip install -q $PY_PINS || true
+  # --no-deps wajib: set pin sudah lengkap; tanpa ini resolver menarik opencv-python
+  # (varian GUI) yang menautkan libxcb/libGL dan gagal di image minimal.
+  pip install -q --no-deps $PY_PINS || true
 fi
 
 # --- 5. model Whisper small ---
