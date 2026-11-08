@@ -1,0 +1,118 @@
+name: build-cache
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag Release yang dibuat"
+        required: true
+        default: v1.0-cache
+
+permissions:
+  contents: write
+
+env:
+  PYVER: "3.11"
+  DISTRO: "bookworm"
+  HF_MODEL: "Systran/faster-whisper-small"
+  HF_REV: "536b0662742c02347bc0e980a01041f333bce120"
+  APT_PKGS: "tesseract-ocr=5.3.0-2 tesseract-ocr-ind=1:4.1.0-2 tesseract-ocr-eng=1:4.1.0-2 tesseract-ocr-osd=1:4.1.0-2"
+  # Versi dikunci penuh (29 paket) hasil resolusi di Debian 12 / Python 3.11.
+  # --no-deps dipakai agar resolver pip tidak pernah memilih versi lain.
+  PINS: >-
+    rapidocr-onnxruntime==1.4.4 opencv-python==5.0.0.93 numpy==2.4.6 onnxruntime==1.31.1
+    pyclipper==1.4.0 pillow==13.0.0 pyyaml==6.0.3 shapely==2.2.0 six==1.17.0 tqdm==4.70.1
+    faster-whisper==1.2.1 ctranslate2==4.8.5 av==18.1.0 tokenizers==0.23.3 huggingface_hub==2.4.0
+    hf-xet==1.8.0 filelock==4.2.9 fsspec==2026.9.0 packaging==26.3 typing_extensions==4.16.0
+    flatbuffers==25.12.19 protobuf==7.36.2 httpx2==2.16.0 httpcore2==2.16.0 anyio==4.16.0
+    h11==0.16.0 idna==3.20 truststore==0.10.5 click==8.5.1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Siapkan folder
+        run: mkdir -p out/wheels out/deb out/models
+
+      - name: Unduh wheel Python (pin, tanpa resolusi ulang)
+        run: |
+          docker run --rm -e PINS="$PINS" -v "$PWD/out/wheels:/w" python:${PYVER}-slim-${DISTRO} bash -c '
+            set -e
+            pip install -q --upgrade pip
+            pip download --no-deps --only-binary=:all: -d /w $PINS
+            pip install -q --no-index --no-deps --find-links=/w $PINS
+            python -c "import rapidocr_onnxruntime, faster_whisper, ctranslate2, onnxruntime"
+            echo "wheel: $(ls /w | wc -l) file"
+          '
+
+      - name: Unduh .deb tesseract (pin versi bookworm)
+        run: |
+          docker run --rm -e APT_PKGS="$APT_PKGS" -v "$PWD/out/deb:/d" debian:${DISTRO}-slim bash -c '
+            set -e
+            apt-get update -qq
+            apt-get install -y --download-only --no-install-recommends $APT_PKGS
+            cp /var/cache/apt/archives/*.deb /d/
+            echo "deb: $(ls /d | wc -l) file"
+          '
+
+      - name: Unduh model Whisper small (revisi dikunci) + uji muat offline
+        run: |
+          printf '%s\n' \
+            "import os" \
+            "from huggingface_hub import snapshot_download" \
+            "p = snapshot_download(os.environ['HF_MODEL'], revision=os.environ['HF_REV'], local_dir='/m/small')" \
+            "print('model:', p)" > /tmp/dl.py
+          printf '%s\n' \
+            "from faster_whisper import WhisperModel" \
+            "WhisperModel('/m/small', device='cpu', compute_type='int8')" \
+            "print('offline load ok')" > /tmp/load.py
+          docker run --rm -e PINS="$PINS" -e HF_MODEL="$HF_MODEL" -e HF_REV="$HF_REV" \
+            -v /tmp/dl.py:/dl.py:ro -v /tmp/load.py:/load.py:ro \
+            -v "$PWD/out/wheels:/w:ro" -v "$PWD/out/models:/m" \
+            python:${PYVER}-slim-${DISTRO} bash -c '
+            set -e
+            pip install -q --upgrade pip
+            pip install -q --no-index --no-deps --find-links=/w $PINS
+            python /dl.py
+            HF_HUB_OFFLINE=1 python /load.py
+            du -sh /m/small
+          '
+
+      - name: Kemas aset + checksum
+        run: |
+          sudo chown -R "$USER" out
+          cd out
+          tar -czf wheels.tar.gz -C wheels .
+          tar -czf debs.tar.gz -C deb .
+          tar -czf models.tar.gz --exclude='.cache' -C models small
+          sha256sum wheels.tar.gz debs.tar.gz models.tar.gz > SHA256SUMS
+          ls -lh wheels.tar.gz debs.tar.gz models.tar.gz
+          md5sum SHA256SUMS >/dev/null
+          echo "wheel: $(ls wheels | wc -l) | deb: $(ls deb | wc -l) | model: $(ls models/small | tr '\n' ' ')"
+
+      - name: Publikasikan Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          name: Cache OCR + Whisper small ${{ github.event.inputs.tag }}
+          body: |
+            Aset cache bootstrap sandbox LobeHub (Debian 12 bookworm, Python 3.11).
+            Versi dikunci: lihat `PINS` dan `HF_REV` di `.github/workflows/build-cache.yml`.
+
+            Pasang — dua langkah, jangan `curl | bash`:
+
+            ```
+            curl -fsSL -o /tmp/bootstrap.sh https://raw.githubusercontent.com/mt4al3rt-sudo/lobe-cache/main/scripts/bootstrap.sh
+            sha256sum /tmp/bootstrap.sh && less /tmp/bootstrap.sh
+            bash /tmp/bootstrap.sh
+            ```
+
+            Isi: `wheels.tar.gz`, `debs.tar.gz`, `models.tar.gz` (Whisper small CTranslate2),
+            `SHA256SUMS`. Semua aset diverifikasi checksum sebelum diekstrak.
+          files: |
+            out/wheels.tar.gz
+            out/debs.tar.gz
+            out/models.tar.gz
+            out/SHA256SUMS
+          fail_on_unmatched_files: true
