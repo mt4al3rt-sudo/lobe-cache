@@ -41,6 +41,9 @@ jobs:
           print("parity: identik")
           PY
 
+      - name: Tes mode bootstrap (tanpa unduhan)
+        run: bash scripts/test-bootstrap.sh scripts/bootstrap.sh
+
       - name: Pasang 29 paket (versi dikunci, tanpa resolver)
         run: |
           python -m pip install -q --upgrade pip
