@@ -69,12 +69,27 @@ ok_model() { [ -f "${MODEL}/model.bin" ]; }
 want_model=0
 case "$MODE" in whisper|models) want_model=1 ;; esac
 
+# Mode "models" hanya menyentuh model: OCR & paket python tidak dipasang.
+need_ocr=1
+[ "$MODE" = "models" ] && need_ocr=0
+
+plan_status() { # $1 = ocr|py
+  if [ "$need_ocr" = 0 ]; then echo "tidak (mode ${MODE})"; return; fi
+  if [ "$1" = "ocr" ]; then
+    if ok_ocr; then echo "sudah ada"; else echo "pasang/unduh"; fi
+  else
+    if ok_py; then echo "sudah ada"; else echo "pasang/unduh"; fi
+  fi
+}
+
 # --- rencana ---
 if [ "$PLAN" = 1 ]; then
   echo "[cache] arch    : ${ARCH} (prebuilt: $([ "$PREBUILT" = 1 ] && echo ya || echo tidak))"
   echo "[cache] mode    : ${MODE}"
-  echo "[cache] wheels  : $([ "$PREBUILT" = 1 ] && ! ok_py && echo "unduh wheels.tar.gz" || echo "tidak (tidak perlu / arch lain)")"
-  echo "[cache] debs    : $([ "$PREBUILT" = 1 ] && ! ok_ocr && echo "unduh debs.tar.gz" || echo "tidak (tidak perlu / arch lain)")"
+  echo "[cache] tesseract: $(plan_status ocr)"
+  echo "[cache] python   : $(plan_status py)"
+  echo "[cache] wheels  : $([ "$PREBUILT" = 1 ] && [ "$need_ocr" = 1 ] && ! ok_py && echo "unduh wheels.tar.gz" || echo "tidak (tidak perlu / arch lain)")"
+  echo "[cache] debs    : $([ "$PREBUILT" = 1 ] && [ "$need_ocr" = 1 ] && ! ok_ocr && echo "unduh debs.tar.gz" || echo "tidak (tidak perlu / arch lain)")"
   echo "[cache] model   : $([ "$want_model" = 1 ] && ! ok_model && echo "unduh models.tar.gz (426 MB)" || ([ "$want_model" = 1 ] && echo "sudah ada" || echo "tidak diminta (mode ${MODE})"))"
   exit 0
 fi
@@ -83,8 +98,10 @@ mkdir -p "$W"
 printf 'export WHISPER_MODEL=%s\n' "$MODEL" > "${W}/whisper_env.sh"
 
 ready=1
-ok_ocr || ready=0
-ok_py || ready=0
+if [ "$need_ocr" = 1 ]; then
+  ok_ocr || ready=0
+  ok_py || ready=0
+fi
 [ "$want_model" = 1 ] && { ok_model || ready=0; }
 if [ "$ready" = 1 ]; then
   echo "[cache] sudah siap (mode: ${MODE}, model: $(ok_model && echo ada || echo tidak diminta))"
@@ -179,7 +196,7 @@ fi
 have_sum() { [ -s SHA256SUMS ]; }
 
 # --- 1. tesseract ---
-if ! ok_ocr; then
+if [ "$need_ocr" = 1 ] && ! ok_ocr; then
   if [ "$need_debs" = 1 ] && have_sum && fetch_verified debs.tar.gz; then
     rm -rf deb && mkdir -p deb && tar -xzf debs.tar.gz -C deb
     install_debs deb || true
@@ -193,7 +210,7 @@ if ! ok_ocr; then
 fi
 
 # --- 2. paket python ---
-if ! ok_py; then
+if [ "$need_ocr" = 1 ] && ! ok_py; then
   if [ "$need_wheels" = 1 ] && have_sum && fetch_verified wheels.tar.gz; then
     rm -rf whl && mkdir -p whl && tar -xzf wheels.tar.gz -C whl
     pip install -q --no-index --no-deps --find-links=whl $PY_PINS >/dev/null 2>&1 || true
@@ -237,14 +254,22 @@ fi
 printf 'export WHISPER_MODEL=%s\n' "$MODEL" > "${W}/whisper_env.sh"
 
 # --- ringkasan ---
-echo "[cache] tesseract: $(command -v tesseract >/dev/null 2>&1 && tesseract --version 2>/dev/null | head -1 || echo GAGAL)"
+if [ "$need_ocr" = 1 ]; then
+  echo "[cache] tesseract: $(command -v tesseract >/dev/null 2>&1 && tesseract --version 2>/dev/null | head -1 || echo GAGAL)"
+else
+  echo "[cache] tesseract: dilewati (mode ${MODE})"
+fi
 echo "[cache] env      : source ${W}/whisper_env.sh"
 
-if ! python3 -c "import rapidocr_onnxruntime, faster_whisper" >/dev/null 2>&1; then
-  echo "[cache] python   : GAGAL (rapidocr/faster-whisper tidak bisa diimpor)"
-  exit 4
+if [ "$need_ocr" = 1 ]; then
+  if ! python3 -c "import rapidocr_onnxruntime, faster_whisper" >/dev/null 2>&1; then
+    echo "[cache] python   : GAGAL (rapidocr/faster-whisper tidak bisa diimpor)"
+    exit 4
+  fi
+  echo "[cache] python   : ok"
+else
+  echo "[cache] python   : dilewati (mode ${MODE})"
 fi
-echo "[cache] python   : ok"
 
 if [ "$want_model" = 1 ]; then
   if ! ok_model; then
