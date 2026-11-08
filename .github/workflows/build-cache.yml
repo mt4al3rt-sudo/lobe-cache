@@ -20,7 +20,7 @@ env:
   # Versi dikunci penuh (29 paket) hasil resolusi di Debian 12 / Python 3.11.
   # --no-deps dipakai agar resolver pip tidak pernah memilih versi lain.
   PINS: >-
-    rapidocr-onnxruntime==1.4.4 opencv-python==5.0.0.93 numpy==2.4.6 onnxruntime==1.31.1
+    rapidocr-onnxruntime==1.4.4 opencv-python-headless==4.12.0.88 numpy==2.2.6 onnxruntime==1.31.1
     pyclipper==1.4.0 pillow==13.0.0 pyyaml==6.0.3 shapely==2.2.0 six==1.17.0 tqdm==4.70.1
     faster-whisper==1.2.1 ctranslate2==4.8.5 av==18.1.0 tokenizers==0.23.3 huggingface_hub==2.4.0
     hf-xet==1.8.0 filelock==4.2.9 fsspec==2026.9.0 packaging==26.3 typing_extensions==4.16.0
@@ -42,8 +42,20 @@ jobs:
             pip install -q --upgrade pip
             pip download --no-deps --only-binary=:all: -d /w $PINS
             pip install -q --no-index --no-deps --find-links=/w $PINS
-            python -c "import rapidocr_onnxruntime, faster_whisper, ctranslate2, onnxruntime"
+            python -c "import cv2, rapidocr_onnxruntime, faster_whisper, ctranslate2, onnxruntime"
             echo "wheel: $(ls /w | wc -l) file"
+          '
+
+      - name: Verifikasi varian OpenCV (headless saja)
+        run: |
+          docker run --rm -e PINS="$PINS" -v "$PWD/out/wheels:/w:ro" python:${PYVER}-slim-${DISTRO} bash -c '
+            set -e
+            ls /w | grep -q "opencv_python_headless" || { echo "FATAL: wheel headless tidak ada"; exit 1; }
+            if ls /w | grep -Eq "^opencv_python-[0-9]"; then echo "FATAL: wheel GUI opencv-python ikut terunduh"; exit 1; fi
+            pip install -q --no-index --no-deps --find-links=/w $PINS
+            python -c "import cv2; print(\"cv2\", cv2.__version__)"
+            if pip list --format=freeze 2>/dev/null | grep -qi "^opencv-python=="; then echo "FATAL: opencv-python ikut terpasang"; exit 1; fi
+            echo "OpenCV headless saja: ok"
           '
 
       - name: Unduh .deb tesseract (pin versi bookworm)
