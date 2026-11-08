@@ -1,0 +1,111 @@
+name: validate-cache
+
+# Validasi read-only: tidak membuat Release, tidak menulis ke repo.
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/build-cache.yml"
+      - ".github/workflows/validate-cache.yml"
+      - "scripts/bootstrap.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Ambil pin dari build-cache.yml + cek parity bootstrap.sh
+        run: |
+          pip install -q "pyyaml==6.0.3"
+          python - <<'PY'
+          import re, yaml
+          wf = yaml.safe_load(open(".github/workflows/build-cache.yml"))
+          pins = wf["env"]["PINS"].split()
+          open("/tmp/pins.txt", "w").write("\n".join(pins) + "\n")
+          src = open("scripts/bootstrap.sh").read()
+          m = re.search(r'PY_PINS="(.*?)"', src, re.S)
+          bp = " ".join(m.group(1).split()).split()
+          print(f"pin workflow: {len(pins)} | bootstrap: {len(bp)}")
+          diff = set(pins) ^ set(bp)
+          if diff:
+              raise SystemExit(f"pin tidak sama: {sorted(diff)}")
+          print("parity: identik")
+          PY
+
+      - name: Pasang 29 paket (versi dikunci, tanpa resolver)
+        run: |
+          python -m pip install -q --upgrade pip
+          pip install -q --no-deps -r /tmp/pins.txt
+
+      - name: Cek versi + varian OpenCV tunggal
+        run: |
+          python -c "
+          import cv2, numpy
+          print('cv2', cv2.__version__, '| numpy', numpy.__version__)
+          assert numpy.__version__ == '2.2.6', numpy.__version__
+          assert cv2.__version__ == '4.12.0', cv2.__version__
+          "
+          if pip list --format=freeze | grep -qi '^opencv-python=='; then
+            echo "FATAL: varian GUI opencv-python ikut terpasang"; exit 1
+          fi
+          pip list --format=freeze | grep -qi '^opencv-python-headless==' || { echo "FATAL: headless tidak terpasang"; exit 1; }
+          echo "OpenCV headless saja: ok"
+
+      - name: Tanpa penautan X11/GL
+        run: |
+          SO=$(python -c "import cv2,os;print(os.path.dirname(cv2.__file__))")
+          if ldd "$SO"/cv2.abi3.so | grep -E 'libxcb|libGL|libgtk'; then
+            echo "FATAL: cv2 menautkan library X11/GL"; exit 1
+          fi
+          echo "linkage bersih: ok"
+
+      - name: Import paket kunci
+        run: |
+          python -c "
+          import cv2, numpy, onnxruntime, ctranslate2, faster_whisper, rapidocr_onnxruntime
+          print('import ok:', cv2.__version__, numpy.__version__, onnxruntime.__version__, faster_whisper.__version__)
+          "
+
+      - name: OCR nyata (Pillow + RapidOCR)
+        run: |
+          python - <<'PY'
+          from PIL import Image, ImageDraw
+          import rapidocr_onnxruntime
+
+          img = Image.new("RGB", (720, 160), "white")
+          d = ImageDraw.Draw(img)
+          d.text((20, 40), "NUMPY 2.2.6 OCR PASS", fill="black")
+          d.text((20, 100), "Validasi x86_64 headless", fill="black")
+          img.save("/tmp/ocr.png")
+
+          res, _ = rapidocr_onnxruntime.RapidOCR()("/tmp/ocr.png")
+          texts = [r[1] for r in (res or [])]
+          joined = " ".join(texts).upper()
+          print("teks terbaca:", texts)
+          assert "OCR" in joined and "PASS" in joined, joined
+          print("OCR nyata: PASS")
+          PY
+
+      - name: pip check (hanya pengecualian RapidOCR yang ditoleransi)
+        run: |
+          pip check > /tmp/check.txt 2>&1 || true
+          cat /tmp/check.txt
+          grep -v '^rapidocr-onnxruntime 1.4.4 requires opencv-python, which is not installed\.$' /tmp/check.txt \
+            | grep -v '^$' > /tmp/other.txt || true
+          if [ -s /tmp/other.txt ]; then
+            echo "FATAL: konflik dependensi di luar pengecualian:"; cat /tmp/other.txt; exit 1
+          fi
+          echo "pip check: hanya pengecualian metadata RapidOCR -> opencv-python (dokumentasi, bukan regresi)"
+
+      - name: Ringkasan PASS
+        run: |
+          echo "PASS: 29 pin identik, headless tunggal, numpy 2.2.6, tanpa linkage X11, import ok, OCR ok, pip check bersih"
