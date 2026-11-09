@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="id">
+<head><meta charset="utf-8"><title>Halaman Uji</title>
+<style>body{font-family:sans-serif}button{padding:8px}</style></head>
+<body>
+<main>
+  <h1>Konter Sederhana</h1>
+  <p id="out">Hitungan: 0</p>
+  <button id="btn">Tambah</button>
+</main>
+<script>
+  var count = 0;
+  var out = document.getElementById('out');
+  var btn = document.getElementById('btn');
+  function bump(){ count += 1; out.textContent = 'Hitungan: ' + count; }
+  if (btn) btn.addEventListener('click', bump);
+</script>
+</body>
+</html>
