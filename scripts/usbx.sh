@@ -1,22 +1,28 @@
 #!/usr/bin/env bash
-# usbx v0.9 — Universal Sandbox Skill (LobeHub Cloud Sandbox Free)
+# usbx v0.9.1 — Universal Sandbox Skill (LobeHub Cloud Sandbox Free)
 # Satu pintu masuk: readiness, lazy bootstrap, checkpoint/resume, anti-duplikat,
 # token saver, read-back verify, cost/error log. REUSE-FIRST, tidak menambah infra.
+#
+# v0.9.1 (patch keamanan/reliabilitas, aditif):
+#   doc_find nyata (judul+task-key tepat), bootstrap FAIL-CLOSED, payload byte-exact
+#   (trailing newline utuh), verifikasi hapus & flush log, validasi task-key,
+#   fallback KB lokal saat lh gagal. Lock tetap LOKAL, bukan lintas-sandbox.
 #
 #   usbx ready                 cek kesiapan sandbox + lh (retry 3x, fallback resmi)
 #   usbx boot [--ocr-only|--with-whisper|--models-only|--plan]
 #   usbx ckpt save <KEY> [DESC] [FILE|-]   simpan checkpoint ke KB (payload via stdin)
-#   usbx ckpt get <KEY>        pulihkan + verifikasi sha256
+#   usbx ckpt get <KEY>        pulihkan + verifikasi sha256 (payload mentah ke stdout)
 #   usbx ckpt list [PREFIX]    cari checkpoint berdasarkan task-key
-#   usbx ckpt del <KEY>        hapus 1 checkpoint (wajib cocok persis)
-#   usbx guard <KEY> -- <cmd...>           single-writer lokal (flock)
+#   usbx ckpt del <KEY>        hapus 1 checkpoint (wajib cocok persis + verifikasi)
+#   usbx guard <KEY> -- <cmd...>           single-writer LOKAL (flock), bukan global
 #   usbx trim '<jq-filter>' [maxbytes]     saring data besar sebelum ke LLM
 #   usbx verify <FILE> [SHA]   baca ulang file, cocokkan sha256
 #   usbx log <KEY> <pesan> | usbx log flush
 #
-# Exit: 0 ok, 2 argumen/data, 3 lingkungan (lh/sandbox), 4 verifikasi gagal.
+# Exit: 0 ok, 2 argumen/data, 3 lingkungan (lh/sandbox), 4 verifikasi gagal,
+#       5 lock aktif, 6 output dipotong.
 set -uo pipefail
-USBX_VER="0.9"
+USBX_VER="0.9.1"
 KB="${USBX_KB:-kb_pEpJxnLfdrAR}"
 PROJ="${USBX_PROJECTS:-docs_mHQhSgO9pI2YFR3r}"
 BOOT_URL="${USBX_BOOT_URL:-https://raw.githubusercontent.com/mt4al3rt-sudo/lobe-cache/main/scripts/bootstrap.sh}"
@@ -33,7 +39,7 @@ lh_candidates() {
   c=$(command -v lh 2>/dev/null) && [ -n "$c" ] && printf '%s\n' "$c"
 }
 
-# Pilih biner lh pertama yang benar-benar bisa bicara ke API (versi global lama bisa ada di PATH).
+# Pilih biner lh pertama yang benar-benar bisa bicara ke API.
 need_lh() {
   local i c
   for i in 1 2 3; do
@@ -48,6 +54,57 @@ EOF
   echo "[usbx] GAGAL: tidak ada lh siap (PATH / /tmp/tmp.* / global). Fallback resmi: lh login atau lh doctor" >&2
   return 3
 }
+
+# --- validasi task-key: cegah path traversal & karakter kendali ---
+valid_key() {
+  local k="${1:-}"
+  [ -n "$k" ] || return 1
+  case "$k" in *..*|*/*|*\\*|*[[:space:]]*|*[[:cntrl:]]*) return 1 ;; esac
+  printf '%s' "$k" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+}
+require_key() {
+  valid_key "${1:-}" && return 0
+  echo "[usbx] task-key tidak valid: '${1:-}' (hanya A-Za-z0-9 . _ - , maks 64, tanpa '..' / '/' / spasi)" >&2
+  return 2
+}
+
+# --- akses dokumen lh ---
+doc_list_json() { [ -n "${LH:-}" ] || return 1; "$LH" doc list --json id,title -L 200 --all 2>/dev/null; }
+
+# doc_find <title-prefix> [--unique]
+# Prefix wajib memuat pemisah ('CHECKPOINT <KEY> —'), sehingga task-key A tidak
+# pernah cocok dengan task-key A2. Hasil ganda: default pakai yang pertama +
+# PERINGATAN; dengan --unique batal (rc 2) daripada menebak dokumen yang salah.
+doc_find() {
+  local want="${1:-}" mode="${2:-}"
+  [ -n "$want" ] || return 0
+  local j ids n
+  j=$(doc_list_json) || return 0
+  ids=$(printf '%s' "$j" | jq -r --arg w "$want" '
+    if type=="array" then
+      [ .[]? | select(((.title // "") | startswith($w))) | .id ]
+    else empty end | .[]' 2>/dev/null) || return 0
+  [ -n "$ids" ] || return 0
+  n=$(printf '%s\n' "$ids" | grep -c .)
+  if [ "$n" -gt 1 ]; then
+    echo "[usbx] PERINGATAN: $n dokumen cocok prefix '$want': $(printf '%s' "$ids" | tr '\n' ' ')" >&2
+    if [ "$mode" = "--unique" ]; then
+      echo "[usbx] BATAL: judul tidak unik — rapikan duplikat dulu, jangan menebak" >&2
+      return 2
+    fi
+  fi
+  printf '%s\n' "$ids" | head -1
+}
+ckpt_prefix() { printf 'CHECKPOINT %s —' "${1:-}"; }
+
+# Ambil PAYLOAD-B64 dari keluaran `lh doc view` (tahan baris terlipat/spasi).
+doc_b64() {
+  printf '%s\n' "${1:-}" | awk '
+    /PAYLOAD-B64:/ { sub(/.*PAYLOAD-B64:[ \t]*/, ""); c=1; print; next }
+    c && /^[ \t]*$/ { exit }
+    c { print }' | tr -d ' \t\r\n'
+}
+doc_sha_field() { printf '%s\n' "${1:-}" | sed -n 's/.*PAYLOAD-SHA256:[[:space:]]*\([a-f0-9]\{64\}\).*/\1/p' | head -1; }
 
 cmd_ready() {
   echo "[usbx] versi      : $USBX_VER"
@@ -75,30 +132,48 @@ cmd_boot() {
     --with-whisper|--models-only)
       [ -f /tmp/whisper-models/small/model.bin ] && [ "$mode" = "--models-only" ] && { echo "[usbx] model whisper sudah ada"; return 0; } ;;
   esac
-  if [ ! -s /tmp/bs.sh ]; then
+  local bs="/tmp/bs.sh" s
+  if [ ! -s "$bs" ]; then
     echo "[usbx] ambil bootstrap.sh"
-    curl -fsSL -o /tmp/bs.sh "$BOOT_URL" || { echo "[usbx] GAGAL unduh bootstrap.sh" >&2; return 3; }
+    curl -fsSL -o "$bs" "$BOOT_URL" || { echo "[usbx] GAGAL unduh bootstrap.sh" >&2; return 3; }
   fi
-  local s; s=$(sha256sum /tmp/bs.sh | cut -d' ' -f1)
+  s=$(sha256sum "$bs" | cut -d' ' -f1)
+  if [ "$s" != "$BOOT_SHA" ]; then
+    echo "[usbx] sha lokal ($s) != pin — unduh ulang sekali untuk menyingkirkan berkas basi"
+    curl -fsSL -o "$bs" "$BOOT_URL" || { echo "[usbx] GAGAL unduh ulang bootstrap.sh" >&2; return 3; }
+    s=$(sha256sum "$bs" | cut -d' ' -f1)
+  fi
   echo "[usbx] bootstrap.sh sha256=$s"
-  [ "$s" = "$BOOT_SHA" ] || echo "[usbx] PERINGATAN: sha beda dari pin ($BOOT_SHA) — periksa dulu: less /tmp/bs.sh"
-  bash /tmp/bs.sh "$mode"; local rc=$?
+  # FAIL-CLOSED: hash tidak cocok = skrip TIDAK dijalankan.
+  if [ -z "$s" ] || [ "$s" != "$BOOT_SHA" ]; then
+    echo "[usbx] BOOT FAIL-CLOSED: sha256 ($s) != pin ($BOOT_SHA). Skrip TIDAK dijalankan." >&2
+    echo "[usbx] Periksa manual: less $bs — jangan jalankan sebelum yakin." >&2
+    return 4
+  fi
+  bash "$bs" "$mode"; local rc=$?
   [ -f /tmp/lobe-cache/whisper_env.sh ] && echo "[usbx] env: source /tmp/lobe-cache/whisper_env.sh"
   return $rc
 }
 
 cmd_ckpt() {
-  local sub="${1:-}"; local key="${2:-}"; shift 2 2>/dev/null || shift $#
+  local sub="${1:-}"; shift || true
+  local key="${1:-}"; [ $# -gt 0 ] && shift || true
   case "$sub" in
     save)
       local desc="${1:-Sandbox checkpoint}"; local src="${2:--}"
-      [ -z "$key" ] && { echo "[usbx] butuh task-key" >&2; return 2; }
-      local payload
-      if [ "$src" = "-" ]; then payload=$(cat); else [ -f "$src" ] || { echo "[usbx] file tidak ada: $src" >&2; return 2; }; payload=$(cat "$src"); fi
-      [ -n "$payload" ] || { echo "[usbx] payload kosong" >&2; return 2; }
+      require_key "$key" || return 2
+      local pf="$STATE/ckpt-$key.payload"
+      if [ "$src" = "-" ]; then
+        cat >"$pf"
+      else
+        [ -f "$src" ] || { echo "[usbx] file tidak ada: $src" >&2; return 2; }
+        cp -- "$src" "$pf" || { echo "[usbx] gagal menyalin payload" >&2; return 2; }
+      fi
+      [ -s "$pf" ] || { echo "[usbx] payload kosong" >&2; return 2; }
       local sha b64 ts f title
-      sha=$(printf '%s' "$payload" | sha256sum | cut -d' ' -f1)
-      b64=$(printf '%s' "$payload" | base64 -w0)
+      # sha & base64 dari BERKAS, bukan variabel: trailing newline tetap utuh.
+      sha=$(sha256sum "$pf" | cut -d' ' -f1)
+      b64=$(base64 -w0 <"$pf")
       ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
       title="CHECKPOINT $key — $desc"
       f="$STATE/ckpt-$key.md"
@@ -106,7 +181,7 @@ cmd_ckpt() {
         "$USBX_VER" "$key" "$ts" "$(uname -m)" "${HOSTNAME:-sandbox}" "$sha" "$b64"; } >"$f"
       local L
       if ! L=$(need_lh); then
-        echo "[usbx] PENDING-LH: checkpoint lokal siap ($f)."
+        echo "[usbx] PENDING-LH: checkpoint lokal siap ($f, payload $pf)."
         echo "[usbx] Fallback resmi: simpan isi berkas berikut sebagai dokumen KB $KB (judul di atas), lalu verifikasi read-back."
         echo "-----BEGIN CKPT $key-----"; cat "$f"; echo "-----END CKPT $key-----"
         return 3
@@ -114,54 +189,91 @@ cmd_ckpt() {
       local out id
       out=$("$L" doc create -t "$title" -F "$f" --kb "$KB" --parent "$PROJ" 2>&1) || { echo "[usbx] GAGAL create: $out" >&2; return 3; }
       id=$(printf '%s' "$out" | grep -o 'docs_[A-Za-z0-9]*' | head -1)
-      [ -n "$id" ] || id=$(doc_find "CHECKPOINT $key ")
+      [ -n "$id" ] || id=$(doc_find "$(ckpt_prefix "$key")")
       [ -n "$id" ] || { echo "[usbx] GAGAL: dokumen tidak ditemukan setelah create" >&2; return 3; }
       # read-back verification
-      local back hit
+      local back hit got
       back=$("$L" doc view "$id" 2>/dev/null)
-      hit=$(printf '%s' "$back" | grep -o 'PAYLOAD-B64: [A-Za-z0-9+/=]*' | head -1 | cut -d' ' -f2)
-      if [ -n "$hit" ] && [ "$(printf '%s' "$hit" | base64 -d 2>/dev/null | sha256sum | cut -d' ' -f1)" = "$sha" ]; then
+      hit=$(doc_b64 "$back")
+      got=$(printf '%s' "$hit" | base64 -d 2>/dev/null | sha256sum | cut -d' ' -f1)
+      if [ -n "$hit" ] && [ "$got" = "$sha" ]; then
         echo "[usbx] CKPT PASS  key=$key id=$id sha=$sha"
       else
-        echo "[usbx] CKPT FAIL  key=$key id=$id (read-back tidak cocok)" >&2; return 4
+        echo "[usbx] CKPT FAIL  key=$key id=$id (read-back tidak cocok: ${got:-kosong})" >&2
+        echo "[usbx] FALLBACK: berkas lokal siap -> $f ; simpan manual ke KB $KB bila API tidak konsisten" >&2
+        return 4
       fi ;;
     get)
-      local L; L=$(need_lh) || return 3
-      local id; id=$(doc_find "CHECKPOINT $key ")
-      [ -n "$id" ] || { echo "[usbx] TIDAK ADA checkpoint untuk key=$key" >&2; return 2; }
-      local back b64 sha2
-      back=$("$L" doc view "$id" 2>/dev/null)
-      b64=$(printf '%s' "$back" | grep -o 'PAYLOAD-B64: [A-Za-z0-9+/=]*' | head -1 | cut -d' ' -f2)
-      sha2=$(printf '%s' "$back" | grep -o 'PAYLOAD-SHA256: [a-f0-9]*' | head -1 | cut -d' ' -f2)
-      [ -n "$b64" ] || { echo "[usbx] GAGAL decode: payload tidak ada di $id" >&2; return 4; }
-      if [ "$(printf '%s' "$b64" | base64 -d | sha256sum | cut -d' ' -f1)" = "$sha2" ]; then
-        echo "[usbx] CKPT PASS  key=$key id=$id sha=$sha2"
-        printf '%s' "$b64" | base64 -d; echo
-      else echo "[usbx] CKPT FAIL  sha tidak cocok di $id" >&2; return 4; fi ;;
+      require_key "$key" || return 2
+      local L; L=$(need_lh) || L=""
+      local id="" back=""
+      if [ -n "$L" ]; then
+        id=$(doc_find "$(ckpt_prefix "$key")" --unique) || return 2
+        [ -n "$id" ] && back=$("$L" doc view "$id" 2>/dev/null)
+      fi
+      local b64 sha2 src="kb"
+      if [ -n "$back" ]; then
+        b64=$(doc_b64 "$back"); sha2=$(doc_sha_field "$back")
+      elif [ -s "$STATE/ckpt-$key.md" ]; then
+        echo "[usbx] PENDING-LH: lh/KB tidak siap — pulih dari cache lokal $STATE/ckpt-$key.md" >&2
+        back=$(cat "$STATE/ckpt-$key.md"); src="lokal"
+        b64=$(doc_b64 "$back"); sha2=$(doc_sha_field "$back")
+      else
+        echo "[usbx] TIDAK ADA checkpoint untuk key=$key (lh/KB tidak siap, cache lokal kosong)" >&2
+        [ -n "$L" ] && return 2 || return 3
+      fi
+      [ -n "$b64" ] || { echo "[usbx] GAGAL: payload tidak ada di ${id:-$src}" >&2; return 4; }
+      local of="$STATE/ckpt-$key.out"
+      printf '%s' "$b64" | base64 -d >"$of" 2>/dev/null || { echo "[usbx] GAGAL decode base64 (${id:-$src})" >&2; return 4; }
+      local got; got=$(sha256sum "$of" | cut -d' ' -f1)
+      if [ "$got" = "$sha2" ]; then
+        echo "[usbx] CKPT PASS  key=$key id=${id:-$src} sha=$sha2" >&2
+        cat "$of"
+      else
+        echo "[usbx] CKPT FAIL  sha tidak cocok (dapat $got, harap ${sha2:-?})" >&2; return 4
+      fi ;;
     list)
-      local L; L=$(need_lh) || return 3
+      local L; L=$(need_lh) || { echo "[usbx] PENDING-LH: daftar tidak terbaca; pakai 'usbx ckpt get <KEY>' (cache lokal) atau baca KB via tool" >&2; return 3; }
+      if [ -n "$key" ]; then require_key "$key" || return 2; fi
       local r="CHECKPOINT ${key:-}"
-      "$L" doc list --json id,title -L 100 --all 2>/dev/null | jq -r --arg r "$r" '.[]? | select(.title|startswith($r)) | "\(.id)\t\(.title)"' ;;
+      "$L" doc list --json id,title -L 200 --all 2>/dev/null | jq -r --arg r "$r" '.[]? | select((.title // "")|startswith($r)) | "\(.id)\t\(.title)"' ;;
     del)
-      local L; L=$(need_lh) || return 3
-      [ -z "$key" ] && { echo "[usbx] butuh task-key persis" >&2; return 2; }
-      local id; id=$(doc_find "CHECKPOINT $key —")
+      require_key "$key" || return 2
+      local L; L=$(need_lh) || { echo "[usbx] PENDING-LH: hapus tidak bisa diverifikasi tanpa lh. Tidak ada klaim sukses." >&2; return 3; }
+      local id; id=$(doc_find "$(ckpt_prefix "$key")" --unique) || return 2
       [ -n "$id" ] || { echo "[usbx] tidak ada checkpoint berjudul tepat 'CHECKPOINT $key —'" >&2; return 2; }
-      local title; title=$("$L" doc view "$id" 2>/dev/null | head -1)
-      printf '%s' "$title" | grep -q "CHECKPOINT $key " || { echo "[usbx] identitas tidak cocok, batal: $title" >&2; return 4; }
-      "$L" doc delete "$id" --yes >/dev/null 2>&1
-      if [ -z "$(doc_find "CHECKPOINT $key —")" ]; then echo "[usbx] terhapus: $id ($title)"
-      else echo "[usbx] GAGAL hapus $id" >&2; return 3; fi ;;
+      # identitas: judul (dari listing) + TASK-KEY di isi dokumen, keduanya wajib cocok
+      local title body
+      title=$(printf '%s' "$(doc_list_json)" | jq -r --arg id "$id" '.[]? | select(.id==$id) | .title' 2>/dev/null | head -1)
+      printf '%s' "$title" | grep -Fq "CHECKPOINT $key —" || { echo "[usbx] identitas judul tidak cocok, batal: ${title:-?}" >&2; return 4; }
+      body=$("$L" doc view "$id" 2>/dev/null)
+      printf '%s\n' "$body" | grep -Fxq "TASK-KEY: $key" || { echo "[usbx] isi dokumen bukan milik $key, batal" >&2; return 4; }
+      local rc=0; "$L" doc delete "$id" --yes >/dev/null 2>&1 || rc=$?
+      # verifikasi nyata: id harus hilang dari listing, bukan sekadar exit code 0
+      local gone=0 i j
+      for i in 1 2 3; do
+        if ! j=$(doc_list_json); then sleep 1; continue; fi
+        if printf '%s' "$j" | jq -e --arg id "$id" '[ .[]? | select(.id==$id) ] | length==0' >/dev/null 2>&1; then gone=1; break; fi
+        sleep 1
+      done
+      if [ "$gone" = 1 ]; then
+        rm -f "$STATE/ckpt-$key.payload" "$STATE/ckpt-$key.out"
+        echo "[usbx] TERHAPUS key=$key id=$id (terverifikasi: tidak ada di listing)"
+      else
+        echo "[usbx] GAGAL hapus key=$key id=$id (rc=$rc, dokumen masih ada / listing tidak konklusif)" >&2; return 3
+      fi ;;
     *) echo "[usbx] ckpt: save|get|list|del" >&2; return 2 ;;
   esac
 }
 
 cmd_guard() {
   local key="${1:-}"; shift || true; [ "${1:-}" = "--" ] && shift
-  [ -z "$key" ] || [ $# -eq 0 ] && { echo "[usbx] guard <KEY> -- <cmd...>" >&2; return 2; }
+  if [ -z "$key" ] || [ $# -eq 0 ]; then echo "[usbx] guard <KEY> -- <cmd...>" >&2; return 2; fi
+  require_key "$key" || return 2
+  mkdir -p "$STATE/locks"
   local lf="$STATE/locks/$key.lock"
   exec 9>"$lf" || return 3
-  if ! flock -n 9; then echo "[usbx] LOCKED: writer lain aktif untuk $key (lokal, bukan lintas-sandbox)" >&2; return 5; fi
+  if ! flock -n 9; then echo "[usbx] LOCKED: writer lain aktif untuk $key (LOCK LOKAL sandbox ini saja, bukan lintas-sandbox)" >&2; return 5; fi
   "$@"
 }
 
@@ -185,21 +297,45 @@ cmd_verify() {
   if [ "$got" = "$want" ]; then echo "[usbx] VERIFY PASS  $f"; else echo "[usbx] VERIFY FAIL  $f (dapat $got, harap $want)" >&2; return 4; fi
 }
 
+# Sidik jari isi log = sha256 dari baris berformat log saja.
+log_sig() { grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z \| ' "${1:-}" 2>/dev/null | sha256sum | cut -d' ' -f1; }
+
 cmd_log() {
   local key="${1:-}"; shift || true
   if [ "$key" = "flush" ]; then
-    local L; L=$(need_lh) || return 3
+    local L; L=$(need_lh) || {
+      echo "[usbx] PENDING-LH: log tetap lokal ($LOGF). Fallback resmi: simpan isi berkas ini sebagai dokumen 'USBX-LOG — ringkasan biaya & error' di KB $KB lewat tool Documents/Knowledge Base." >&2
+      return 3; }
     [ -s "$LOGF" ] || { echo "[usbx] log kosong"; return 0; }
+    local sig; sig=$(log_sig "$LOGF")
     local title="USBX-LOG — ringkasan biaya & error"
     local id; id=$(doc_find "USBX-LOG —")
-    if [ -n "$id" ]; then "$L" doc edit "$id" -F "$LOGF" >/dev/null 2>&1; echo "[usbx] log diperbarui: $id"
+    if [ -n "$id" ]; then
+      "$L" doc edit "$id" -F "$LOGF" >/dev/null 2>&1
     else
       local out; out=$("$L" doc create -t "$title" -F "$LOGF" --kb "$KB" --parent "$PROJ" 2>&1)
-      echo "[usbx] log dibuat: $(printf '%s' "$out" | grep -o 'docs_[A-Za-z0-9]*' | head -1)"
+      id=$(printf '%s' "$out" | grep -o 'docs_[A-Za-z0-9]*' | head -1)
+      [ -n "$id" ] || id=$(doc_find "USBX-LOG —")
+    fi
+    [ -n "$id" ] || { echo "[usbx] LOG GAGAL: dokumen log tidak ditemukan setelah tulis" >&2; return 3; }
+    # read-back verification: isi di KB harus sama dengan berkas lokal
+    local back="" got="" i
+    for i in 1 2 3; do
+      back=$("$L" doc view "$id" 2>/dev/null)
+      printf '%s\n' "$back" >"$STATE/.logback"
+      got=$(log_sig "$STATE/.logback")
+      [ "$got" = "$sig" ] && break
+      sleep 1
+    done
+    if [ "$got" = "$sig" ]; then
+      echo "[usbx] LOG PASS id=$id entri=$(grep -c . "$LOGF") sha=$sig"
+    else
+      echo "[usbx] LOG FAIL id=$id (read-back beda: ${got:-kosong} != $sig)" >&2; return 4
     fi
     return 0
   fi
   [ -z "$key" ] && { echo "[usbx] log <KEY> <pesan>" >&2; return 2; }
+  require_key "$key" || return 2
   printf '%s | %s | %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$key" "$*" >>"$LOGF"
   echo "[usbx] log: $LOGF"
 }
